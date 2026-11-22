@@ -10,6 +10,8 @@ data/cache/, so a re-run costs nothing. --pace sleeps between calls.
 import argparse, csv, json, os, re, subprocess, sys, time, urllib.request, urllib.error
 from datetime import datetime, timezone
 
+import store
+
 CACHE = os.path.join(os.path.dirname(__file__), "data", "cache")
 os.makedirs(CACHE, exist_ok=True)
 TOKEN = None
@@ -27,7 +29,12 @@ def api(path, pace=0.0):
     fn = os.path.join(CACHE, key + ".json")
     if os.path.exists(fn):
         try:
-            return json.load(open(fn))
+            cached = json.load(open(fn))
+            try:
+                store.remember(path, cached)   # warm the store from cache too
+            except Exception as e:
+                sys.stderr.write("store: %s for %s\n" % (e, path))
+            return cached
         except Exception:
             pass
     url = path if path.startswith("http") else "https://api.github.com" + path
@@ -58,6 +65,10 @@ def api(path, pace=0.0):
     else:
         raise SystemExit("giving up on " + path)
     json.dump(data, open(fn, "w"))
+    try:
+        store.remember(path, data)
+    except Exception as e:            # the store must never break a scan
+        sys.stderr.write("store: %s for %s\n" % (e, path))
     return data
 
 
@@ -89,7 +100,10 @@ def repos(login):
 
 def pr_count(login, days):
     since = iso(days_ago(days))
-    d = api("/search/issues?q=author:%s+type:pr+created:%%3E=%s&per_page=1" % (login, since))
+    try:
+        d = api("/search/issues?q=author:%s+type:pr+created:%%3E=%s&per_page=1" % (login, since))
+    except Exception:
+        return 0                          # invalid search syntax (brackets), not a candidate
     return (d or {}).get("total_count", 0)
 
 
@@ -152,9 +166,14 @@ def main():
     ap.add_argument("--out", default="data/users.csv")
     ap.add_argument("--spread", nargs="*", help="logins to test for cross-repo spread")
     ap.add_argument("--attract", nargs="*", help="logins to pool into one attraction dataset")
+    ap.add_argument("--stats", action="store_true", help="print what the store holds")
     ap.add_argument("--per-bot", type=int, default=60)
     ap.add_argument("--controls", type=int, default=1)
     a = ap.parse_args()
+
+    if a.stats:
+        print(json.dumps(store.stats(), indent=1))
+        return
 
     if a.attract:
         rows = attract(a.attract, a.days, a.per_bot, a.controls, "data/attract.csv")
@@ -181,6 +200,8 @@ def main():
 
     rows = []
     for i, login in enumerate(queue[: a.limit], 1):
+        if login.endswith("[bot]"):        # labelled bots are not what we hunt
+            continue
         try:
             f = features(login, a.days)
         except SystemExit as e:
@@ -189,6 +210,12 @@ def main():
         if not f:
             continue
         f["score"], f["components"] = score(f)
+        try:
+            db = store.connect()
+            store.record_score(db, login, f["score"], f["components"])
+            db.commit(); db.close()
+        except Exception as e:
+            sys.stderr.write("store: %s\n" % e)
         rows.append(f)
         sys.stderr.write("[%d/%d] %-24s score=%.3f prs=%d repos=%d follow=%d\n" % (
             i, min(len(queue), a.limit), login, f["score"], f["prs_window"], f["public_repos"], f["following"]))
@@ -239,6 +266,7 @@ def spread(login, days):
 
 
 REF = re.compile(r"(?i)(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s*:?\s*#(\d+)")
+REF_ANY = re.compile(r"#(\\d+)")
 
 
 def issue_features(issue, repo_meta, pr_created):
@@ -278,7 +306,7 @@ def attract(logins, days, per_bot, controls_per_repo, out_csv):
         sys.stderr.write("%s: %d PRs sampled\n" % (login, len(items)))
         seen_repos = {}
         for pr in items:
-            m = REF.search(pr.get("body") or "")
+            m = REF.search(pr.get("body") or "") or REF_ANY.search(pr.get("title") or "")
             if not m:
                 continue
             parts = pr["repository_url"].split("/")
@@ -293,6 +321,14 @@ def attract(logins, days, per_bot, controls_per_repo, out_csv):
             if not issue or "pull_request" in issue:
                 continue
             rows.append(dict(bot=login, picked=1, **issue_features(issue, rm, pr["created_at"])))
+            try:
+                db = store.connect()
+                store.upsert_issue(db, repo_key, issue)
+                store.record_pick(db, repo_key, num, login)
+                store.record_sample(db, login, repo_key, num, "picked")
+                db.commit(); db.close()
+            except Exception as e:
+                sys.stderr.write("store: %s\n" % e)
         # controls: untouched open issues in the same repos
         for repo_key, rm in seen_repos.items():
             picked_numbers = {r["number"] for r in rows if r["repo"] == repo_key}
@@ -302,6 +338,13 @@ def attract(logins, days, per_bot, controls_per_repo, out_csv):
                 if "pull_request" in issue or issue["number"] in picked_numbers:
                     continue
                 rows.append(dict(bot=login, picked=0, **issue_features(issue, rm, iso(time.time()))))
+                try:
+                    db = store.connect()
+                    store.upsert_issue(db, repo_key, issue)
+                    store.record_sample(db, login, repo_key, issue["number"], "control")
+                    db.commit(); db.close()
+                except Exception as e:
+                    sys.stderr.write("store: %s\n" % e)
                 taken += 1
                 if taken >= controls_per_repo:
                     break

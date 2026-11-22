@@ -69,3 +69,15 @@ Pooled over two detected accounts (40 PRs each, up to 8 controls per repo, n≈3
 | issue opened ≤1 day before PR | 6.2% vs 13.9% | 15.9% vs 3.4% | **inverts** |
 
 Label and code block are class-level levers. Freshness was one scanner's habit, not a property of the class.
+
+## Result: three scanners
+
+Adding `RerankerGuo` (which cites issues in its **titles**, not bodies — the corpus builder needs a title fallback or it silently excludes a whole scanner style):
+
+| Signal | RerankerGuo | SAY-5 | bfs2021 |
+|---|---|---|---|
+| fenced code block | 23.3% vs 5.0% | 23.2% vs 7.6% | 25.6% vs 11.4% |
+| `good first issue` | n=0, never picked one | 37.5% vs 14.5% | 33.3% vs 14.5% |
+| issue ≤1 day old | 28.6% vs 6.2% | 7.4% vs 18.0% | 19.4% vs 5.0% |
+
+A fenced code block roughly triples pickup for all three. `good first issue` matters to two of three — it is a targeting choice, not a property of the class. Freshness is noise.
