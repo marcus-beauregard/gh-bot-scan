@@ -7,7 +7,7 @@ on features that do not require judgement, emit candidates ranked by score.
 Rate limits: authenticated REST is 5000/hour. Every response is cached in
 data/cache/, so a re-run costs nothing. --pace sleeps between calls.
 """
-import argparse, json, os, re, subprocess, sys, time, urllib.request, urllib.error
+import argparse, csv, json, os, re, subprocess, sys, time, urllib.request, urllib.error
 from datetime import datetime, timezone
 
 CACHE = os.path.join(os.path.dirname(__file__), "data", "cache")
@@ -151,7 +151,15 @@ def main():
     ap.add_argument("--pace", type=float, default=0.0)
     ap.add_argument("--out", default="data/users.csv")
     ap.add_argument("--spread", nargs="*", help="logins to test for cross-repo spread")
+    ap.add_argument("--attract", nargs="*", help="logins to pool into one attraction dataset")
+    ap.add_argument("--per-bot", type=int, default=60)
+    ap.add_argument("--controls", type=int, default=1)
     a = ap.parse_args()
+
+    if a.attract:
+        rows = attract(a.attract, a.days, a.per_bot, a.controls, "data/attract.csv")
+        report(rows)
+        return
 
     if a.spread:
         print("%-20s %6s %8s %6s %6s %9s" % ("login", "PRs", "distinct", "spread", "1/repo", "rate"))
@@ -228,6 +236,103 @@ def spread(login, days):
         one_pr_per_repo=round(distinct / max(1, len(upstream)), 3) if upstream else 0.0,
         next_pr_speed="%.1f/h" % ((len(items) / (days * 24.0)) if days else 0),
     )
+
+
+REF = re.compile(r"(?i)(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s*:?\s*#(\d+)")
+
+
+def issue_features(issue, repo_meta, pr_created):
+    body = issue.get("body") or ""
+    labels = [l["name"].lower() for l in issue.get("labels", [])]
+    created = issue.get("created_at", "2026-01-01T00:00:00Z")
+    age_days = (datetime.strptime(pr_created[:19], "%Y-%m-%dT%H:%M:%S")
+                - datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S")).days
+    return dict(
+        repo=repo_meta["full_name"],
+        number=issue["number"],
+        labels="|".join(labels),
+        has_gfi=int("good first issue" in labels),
+        has_helpwanted=int("help wanted" in labels),
+        body_len=len(body),
+        has_code_fence=int("\x60\x60\x60" in body),
+        has_checklist=int("- [ ]" in body),
+        n_comments=issue.get("comments", 0),
+        is_assigned=int(bool(issue.get("assignees"))),
+        age_days=max(0, age_days),
+        stars=repo_meta.get("stargazers_count", 0),
+    )
+
+
+def attract(logins, days, per_bot, controls_per_repo, out_csv):
+    """Pooled pickup rates across several detected accounts.
+
+    For each bot: sample their recent PRs, resolve the issue each fixed, and pair
+    it with untouched issues from the same repo. The pairing is what makes the
+    rate meaningful — repos differ wildly in how picky their queues are.
+    """
+    rows = []
+    for login in logins:
+        since = iso(days_ago(days))
+        d = api("/search/issues?q=author:%s+type:pr+created:%%3E=%s&per_page=100" % (login, since)) or {}
+        items = d.get("items", [])[:per_bot]
+        sys.stderr.write("%s: %d PRs sampled\n" % (login, len(items)))
+        seen_repos = {}
+        for pr in items:
+            m = REF.search(pr.get("body") or "")
+            if not m:
+                continue
+            parts = pr["repository_url"].split("/")
+            owner, name = parts[-2], parts[-1]
+            num = int(m.group(1))
+            repo_key = owner + "/" + name
+            if repo_key not in seen_repos:
+                rm = api("/repos/%s" % repo_key) or {}
+                seen_repos[repo_key] = rm
+            rm = seen_repos[repo_key]
+            issue = api("/repos/%s/issues/%d" % (repo_key, num))
+            if not issue or "pull_request" in issue:
+                continue
+            rows.append(dict(bot=login, picked=1, **issue_features(issue, rm, pr["created_at"])))
+        # controls: untouched open issues in the same repos
+        for repo_key, rm in seen_repos.items():
+            picked_numbers = {r["number"] for r in rows if r["repo"] == repo_key}
+            listing = api("/repos/%s/issues?state=open&per_page=%d" % (repo_key, 30)) or []
+            taken = 0
+            for issue in listing:
+                if "pull_request" in issue or issue["number"] in picked_numbers:
+                    continue
+                rows.append(dict(bot=login, picked=0, **issue_features(issue, rm, iso(time.time()))))
+                taken += 1
+                if taken >= controls_per_repo:
+                    break
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
+    if rows:
+        fh = csv.DictWriter(open(out_csv, "w"), fieldnames=list(rows[0].keys()))
+        fh.writeheader()
+        fh.writerows(rows)
+    return rows
+
+
+def report(rows):
+    def rate(sel, name):
+        sub = [r for r in rows if sel(r)]
+        if not sub:
+            return "%-30s n=0" % name
+        p = sum(r["picked"] for r in sub)
+        return "%-30s n=%-5d picked=%-4d rate=%5.1f%%" % (name, len(sub), p, 100.0 * p / len(sub))
+    print("rows:", len(rows), "picked:", sum(r["picked"] for r in rows))
+    for bot in sorted({r["bot"] for r in rows}):
+        sub = [r for r in rows if r["bot"] == bot]
+        print("\n== %s (n=%d)" % (bot, len(sub)))
+        for sel, label in [
+            (lambda r: r["has_gfi"] == 1, "good first issue"),
+            (lambda r: r["has_gfi"] == 0, "no good first issue"),
+            (lambda r: r["has_code_fence"] == 1, "fenced code block"),
+            (lambda r: r["has_code_fence"] == 0, "no fence"),
+            (lambda r: r["age_days"] <= 1, "issue <=1 day old"),
+            (lambda r: r["age_days"] > 7, "issue >7 days old"),
+        ]:
+            print(rate(lambda r, s=sel: s(r) and r["bot"] == bot, label))
 
 if __name__ == "__main__":
     main()

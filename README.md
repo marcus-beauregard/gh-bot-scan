@@ -57,3 +57,15 @@ A high score is a question, not a verdict. The next stage — what attracts the 
 ## Status
 
 Stages 1 and 2 work. The pooled attraction model (all detected accounts → their PRs → the issues they fixed → features → pickup rates) is the next piece.
+
+## Result: two accounts, one correction
+
+Pooled over two detected accounts (40 PRs each, up to 8 controls per repo, n≈320 per account):
+
+| Signal | SAY-5 | bfs2021 | Verdict |
+|---|---|---|---|
+| `good first issue` | 30.0% (n=10) vs 11.6% | 30.0% (n=20) vs 11.4% | replicates |
+| fenced code block | 18.8% (n=154) vs 6.0% | 23.0% (n=87) vs 8.7% | replicates |
+| issue opened ≤1 day before PR | 6.2% vs 13.9% | 15.9% vs 3.4% | **inverts** |
+
+Label and code block are class-level levers. Freshness was one scanner's habit, not a property of the class.
